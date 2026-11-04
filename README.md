@@ -11,3 +11,10 @@ GitHub Pages).
 (or press M) to mute.
 
 See [GAME_DESIGN.md](GAME_DESIGN.md) for the design.
+
+## Lantern Moth II (roguelite)
+
+`v2/index.html` is a separate roguelite version. It is still one-tap play, but
+every 200 m you pick one of three gifts: auto-firing weapons (Ember Bolt, Flame
+Ring, Glow Nova) or passives (shield, magnet, brick smashing, revive and more).
+Wax earned each run buys permanent upgrades, saved on your device.

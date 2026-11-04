@@ -1,0 +1,1160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07050c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Lantern Moth II</title>
+<style>
+  html { height: 100%; box-sizing: border-box; color-scheme: dark; background: #07050c; }
+  html, body {
+    margin: 0; height: 100%; background: #07050c; overflow: hidden;
+    overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ===========================================================================
+// Lantern Moth II: a one-tap roguelite chimney climber.
+// Every 200 m you choose one of three gifts: auto-firing weapons or passives.
+// Wax earned each run buys permanent upgrades.
+// ===========================================================================
+
+const W = 144;            // internal width (height adapts to the screen)
+const WALL = 10;          // chimney wall thickness
+const PX_PER_M = 4;       // world pixels per metre
+const GRAV = 320, FLAP = 125, MAXFALL = 170;
+const LEVEL_EVERY = 200;  // metres between gifts
+let H = 256;
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const dark = document.createElement('canvas');
+const dctx = dark.getContext('2d');
+
+function resize() {
+  const vw = document.body.clientWidth || window.innerWidth;
+  const vh = document.body.clientHeight || window.innerHeight;
+  H = Math.round(Math.min(320, Math.max(220, W * vh / vw)));
+  cv.width = W; cv.height = H; dark.width = W; dark.height = H;
+  const scale = Math.min(vw / W, vh / H);
+  cv.style.width = Math.floor(W * scale) + 'px';
+  cv.style.height = Math.floor(H * scale) + 'px';
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const overlap = (ax, ay, aw, ah, bx, by, bw, bh) => ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+
+// ===========================================================================
+// Pixel art
+// ===========================================================================
+function sprite(rows, pal) {
+  const c = document.createElement('canvas');
+  c.width = rows[0].length; c.height = rows.length;
+  const x = c.getContext('2d');
+  rows.forEach((r, j) => [...r].forEach((ch, i) => {
+    if (pal[ch]) { x.fillStyle = pal[ch]; x.fillRect(i, j, 1, 1); }
+  }));
+  return c;
+}
+
+const MOTH_PAL = { w: '#ecdcb4', W: '#b89a6a', b: '#7a5534', a: '#9a7550', l: '#8a7a6a', L: '#4a3626', Y: '#ffd24a' };
+const MOTH_A = sprite([
+  'ww.a.a.ww', 'wWw.b.wWw', 'wWWbbbWWw', '.wwbbbww.', '...bbb...',
+  '....l....', '...LLL...', '...LYL...', '...LLL...',
+], MOTH_PAL);
+const MOTH_B = sprite([
+  '...a.a...', '....b....', '..wbbbw..', 'wWWbbbWWw', 'wWw.b.wWw',
+  'ww..l..ww', '...LLL...', '...LYL...', '...LLL...',
+], MOTH_PAL);
+
+const SPIDER = sprite(['..k.k..', 'k.kkk.k', '.kRkRk.', 'k.kkk.k', '..k.k..'], { k: '#7a5a8a', R: '#ff4a4a' });
+const BAT_PAL = { k: '#5a4a6a', R: '#ff5a3a' };
+const BAT_A = sprite(['k.........k', 'kk..k.k..kk', 'kkkkkkkkkkk', '..kkRkRkk..', '....kkk....'], BAT_PAL);
+const BAT_B = sprite(['....k.k....', '..kkkkkkk..', 'kkkkRkRkkkk', 'kk..kkk..kk', 'k.........k'], BAT_PAL);
+const WISP = sprite(['..ggg..', '.ggggg.', 'gEgggEg', 'ggggggg', 'ggggggg', 'g.g.g.g'], { g: '#7a7090', E: '#e8c8ff' });
+
+const IC = { Y: '#ffd24a', O: '#ff8a3a', W: '#fff4d0', B: '#8ab8ff', L: '#8a6a4a', R: '#c0503a', b: '#7a5534' };
+const ICONS = {
+  bolt:    sprite(['.....O.', '...OOY.', '..OYYYO', '.OYWYO.', 'OOYYO..', '.OO....', 'O......'], IC),
+  orbit:   sprite(['..O.O..', '.O...O.', 'O..Y..O', '..YWY..', 'O..Y..O', '.O...O.', '..O.O..'], IC),
+  pulse:   sprite(['..BBB..', '.B...B.', 'B..Y..B', 'B.YWY.B', 'B..Y..B', '.B...B.', '..BBB..'], IC),
+  glow:    sprite(['..LLL..', '.L...L.', '.LYYYL.', '.LYWYL.', '.LYYYL.', '.L...L.', '..LLL..'], IC),
+  burn:    sprite(['...Y...', '..YOY..', '...O...', '..WWW..', '..WWW..', '..WWW..', '.LLLLL.'], IC),
+  magnet:  sprite(['WW...WW', 'RR...RR', 'RR...RR', 'RR...RR', '.RR.RR.', '..RRR..', '.......'], IC),
+  wings:   sprite(['W.....W', 'WW...WW', 'WWW.WWW', 'WWWbWWW', '.WWbWW.', '..WbW..', '.......'], IC),
+  ward:    sprite(['.......', 'BBBBB..', '.....B.', 'BBBBBB.', '.......', 'BBBB...', '....B..'], IC),
+  breaker: sprite(['RRR.RRR', 'RRR.RRR', '.......', 'R.RRR.R', '..Y.Y..', '.Y.W.Y.', '...W...'], IC),
+  shield:  sprite(['.BBBBB.', 'BWWWWWB', 'BW...WB', 'BW...WB', '.BW.WB.', '..BWB..', '...B...'], IC),
+  phoenix: sprite(['O..Y..O', 'OO.Y.OO', '.OOYOO.', '..YWY..', '..OYO..', '.O.O.O.', 'O..O..O'], IC),
+  bloom:   sprite(['...Y...', '.Y.O.Y.', '..OWO..', 'YOWWWOY', '..OWO..', '.Y.O.Y.', '...Y...'], IC),
+  oil:     sprite(['...O...', '..OYO..', '.OYYYO.', '.OYWYO.', '.OYYYO.', '..OOO..', '.......'], IC),
+};
+
+function brickTile(c1, c2, mortar, seed) {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 8;
+  const x = c.getContext('2d');
+  x.fillStyle = mortar; x.fillRect(0, 0, 16, 8);
+  const brick = (bx, by) => {
+    x.fillStyle = c1; x.fillRect(bx, by, 7, 3);
+    x.fillStyle = c2; x.fillRect(bx, by + 2, 7, 1);
+  };
+  brick(0, 0); brick(8, 0); brick(-4, 4); brick(4, 4); brick(12, 4);
+  let s = seed;
+  for (let i = 0; i < 6; i++) {
+    s = (s * 9301 + 49297) % 233280; const px = s % 16;
+    s = (s * 9301 + 49297) % 233280; const py = s % 8;
+    x.fillStyle = c2; x.fillRect(px, py, 1, 1);
+  }
+  return c;
+}
+const patBack = ctx.createPattern(brickTile('#3a2028', '#2c1820', '#1a0e14', 7), 'repeat');
+const patWall = ctx.createPattern(brickTile('#5a3226', '#45251c', '#24130e', 3), 'repeat');
+
+// 3x5 bitmap font: 5 rows, each a 3-bit number (4 = left pixel)
+const FONT = {
+  '0': '75557', '1': '26227', '2': '71747', '3': '71317', '4': '55711',
+  '5': '74717', '6': '74757', '7': '71122', '8': '75757', '9': '75717',
+  'A': '25755', 'B': '65656', 'C': '34443', 'D': '65556', 'E': '74647',
+  'F': '74644', 'G': '34553', 'H': '55755', 'I': '72227', 'J': '11152',
+  'K': '55655', 'L': '44447', 'M': '57555', 'N': '65555', 'O': '25552',
+  'P': '65644', 'Q': '25563', 'R': '65655', 'S': '34216', 'T': '72222',
+  'U': '55557', 'V': '55552', 'W': '55575', 'X': '55255', 'Y': '55222',
+  'Z': '71247', ' ': '00000', '+': '02720', '-': '00700', ':': '02020',
+  '.': '00002', '!': '22202', '%': '51245', '/': '11244', '?': '71202',
+};
+function drawGlyphs(s, x, y, sc, col) {
+  ctx.fillStyle = col;
+  for (let i = 0; i < s.length; i++) {
+    const g = FONT[s[i]];
+    if (!g) continue;
+    for (let r = 0; r < 5; r++) {
+      const bits = +g[r];
+      for (let c = 0; c < 3; c++) {
+        if (bits & (4 >> c)) ctx.fillRect(x + i * 4 * sc + c * sc, y + r * sc, sc, sc);
+      }
+    }
+  }
+}
+function text(s, x, y, sc = 1, col = '#fff', align = 'left', shadow = '#000') {
+  s = String(s).toUpperCase();
+  const w = s.length * 4 * sc - sc;
+  if (align === 'center') x = Math.round(x - w / 2);
+  else if (align === 'right') x = Math.round(x - w);
+  if (shadow) drawGlyphs(s, x + sc, y + sc, sc, shadow);
+  drawGlyphs(s, x, y, sc, col);
+}
+
+// ===========================================================================
+// Audio (WebAudio, generated)
+// ===========================================================================
+let actx = null, master, sfxGain, musicGain, noiseBuf, muted = false;
+try { muted = localStorage.getItem('lanternMoth2.muted') === '1'; } catch (e) {}
+
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  master = actx.createGain(); master.gain.value = muted ? 0 : 1; master.connect(actx.destination);
+  sfxGain = actx.createGain(); sfxGain.gain.value = 0.5; sfxGain.connect(master);
+  musicGain = actx.createGain(); musicGain.gain.value = 0.2; musicGain.connect(master);
+  noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  nextNoteT = actx.currentTime + 0.1;
+  setInterval(scheduleMusic, 40);
+}
+function tone(f, dur, type = 'square', vol = 0.3, f2 = null, when = 0, dest = sfxGain) {
+  if (!actx) return;
+  const t0 = actx.currentTime + Math.max(0, when);
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t0);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(dest);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function noise(dur, vol, freq = 1000, q = 1, when = 0, dest = sfxGain, f2 = null) {
+  if (!actx) return;
+  const t0 = actx.currentTime + Math.max(0, when);
+  const s = actx.createBufferSource(); s.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+  bp.frequency.setValueAtTime(freq, t0);
+  if (f2) bp.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(bp); bp.connect(g); g.connect(dest);
+  s.start(t0, Math.random() * 0.5); s.stop(t0 + dur);
+}
+const arp = (fs, gap, dur, vol) => fs.forEach((f, i) => tone(f, dur, 'square', vol, null, i * gap));
+const sfx = {
+  flap()    { tone(260, 0.07, 'triangle', 0.25, 430); },
+  spark()   { tone(990, 0.06, 'square', 0.12); tone(1480, 0.1, 'square', 0.12, null, 0.06); },
+  hit()     { noise(0.25, 0.6, 800, 0.7); tone(220, 0.25, 'sawtooth', 0.18, 55); },
+  whoosh()  { noise(0.45, 0.35, 300, 1.5, 0, sfxGain, 1600); },
+  kill()    { noise(0.12, 0.3, 1500, 1); tone(700, 0.1, 'square', 0.07, 200); },
+  bolt()    { tone(900, 0.05, 'triangle', 0.07, 1500); },
+  nova()    { tone(180, 0.35, 'sine', 0.35, 900); noise(0.3, 0.18, 2000, 0.8); },
+  smash()   { noise(0.18, 0.5, 400, 0.8); },
+  block()   { tone(1400, 0.14, 'triangle', 0.25, 700); },
+  levelup() { arp([523, 659, 784, 1046, 1318], 0.06, 0.14, 0.12); },
+  pick()    { tone(660, 0.08, 'square', 0.12); tone(990, 0.14, 'square', 0.12, null, 0.07); },
+  deny()    { tone(160, 0.12, 'square', 0.12); },
+  reborn()  { arp([392, 523, 659, 784, 1046], 0.08, 0.2, 0.13); },
+  over()    { arp([392, 330, 262, 196], 0.18, 0.25, 0.14); },
+};
+
+// Dm - Bb - F - C arpeggios over a triangle bass
+const STEP = 60 / 140 / 2;
+const CHORDS = [[-7, -4, 0, 5], [-11, -7, -4, 1], [-4, 0, 3, 8], [-9, -5, -2, 3]];
+const BASS = [-31, -23, -28, -21];
+const ARP_A = [0, 1, 2, 3, 2, 1, 2, 1];
+const ARP_B = [3, 2, 1, 0, 1, 2, 3, 2];
+let musicStep = 0, nextNoteT = 0;
+const nf = n => 440 * Math.pow(2, n / 12);
+function scheduleMusic() {
+  if (!actx || actx.state !== 'running') return;
+  if (nextNoteT < actx.currentTime) nextNoteT = actx.currentTime + 0.05;
+  while (nextNoteT < actx.currentTime + 0.15) {
+    const bar = Math.floor(musicStep / 8) % 4, s = musicStep % 8;
+    const phrase = Math.floor(musicStep / 32) % 2;
+    const w = nextNoteT - actx.currentTime;
+    tone(nf(CHORDS[bar][(phrase ? ARP_B : ARP_A)[s]]), STEP * 0.9, 'square', 0.12, null, w, musicGain);
+    if (s % 2 === 0) tone(nf(BASS[bar]), STEP * 1.8, 'triangle', 0.5, null, w, musicGain);
+    else noise(0.03, 0.15, 7000, 1, w, musicGain);
+    musicStep++;
+    nextNoteT += STEP;
+  }
+}
+function setMusicLevel(v) { if (actx) musicGain.gain.setTargetAtTime(v, actx.currentTime, 0.3); }
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('lanternMoth2.muted', muted ? '1' : '0'); } catch (e) {}
+  if (actx) master.gain.setTargetAtTime(muted ? 0 : 1, actx.currentTime, 0.02);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!actx) return;
+  if (document.hidden) actx.suspend(); else actx.resume();
+});
+
+// ===========================================================================
+// Persistent progress (this device only)
+// ===========================================================================
+const META_KEY = 'lanternMoth2.meta';
+const meta = { wax: 0, best: 0, perm: { wick: 0, oil: 0, luck: 0, start: 0 } };
+try {
+  const m = JSON.parse(localStorage.getItem(META_KEY));
+  if (m && typeof m === 'object') {
+    meta.wax = +m.wax || 0; meta.best = +m.best || 0;
+    for (const k in meta.perm) meta.perm[k] = +(m.perm && m.perm[k]) || 0;
+  }
+} catch (e) {}
+function saveMeta() { try { localStorage.setItem(META_KEY, JSON.stringify(meta)); } catch (e) {} }
+
+const PERMS = [
+  { id: 'wick',  name: 'BRIGHT WICK', icon: 'glow',  max: 3, cost: [30, 60, 100], desc: '+10 MAX LIGHT' },
+  { id: 'oil',   name: 'THICK OIL',   icon: 'burn',  max: 3, cost: [40, 80, 120], desc: 'LIGHT FADES 5% SLOWER' },
+  { id: 'luck',  name: 'LUCKY DUST',  icon: 'bloom', max: 3, cost: [25, 50, 90],  desc: '+1 REROLL EACH RUN' },
+  { id: 'start', name: 'EARLY GIFT',  icon: 'orbit', max: 1, cost: [80],          desc: 'START WITH A FREE GIFT' },
+];
+
+// ===========================================================================
+// In-run gifts. d(level) returns the description of taking the next level.
+// ===========================================================================
+const BOLT_CD = [0, 1.5, 1.1, 1.1, 0.8, 0.8], BOLT_N = [0, 1, 1, 2, 2, 3];
+const NOVA_CD = [0, 6, 5, 4.2, 3.5, 2.8], NOVA_R = [0, 30, 36, 42, 48, 56];
+const SHIELD_CD = [0, 20, 15, 11, 8];
+const UPS = [
+  { id: 'bolt', kind: 'w', name: 'EMBER BOLT', max: 5,
+    d: l => l === 0 ? ['SHOOTS EMBERS AT', 'NEARBY CREATURES'] : (l === 2 || l === 4) ? ['+1 EMBER PER SHOT'] : ['FIRES FASTER'] },
+  { id: 'orbit', kind: 'w', name: 'FLAME RING', max: 4,
+    d: l => l === 0 ? ['A FLAME CIRCLES YOU', 'BURNING WHAT IT TOUCHES'] : ['+1 CIRCLING FLAME'] },
+  { id: 'pulse', kind: 'w', name: 'GLOW NOVA', max: 5,
+    d: l => l === 0 ? ['BURSTS OF LIGHT BURN', 'FOES AND BREAK BRICKS'] : ['BIGGER BURSTS', 'MORE OFTEN'] },
+  { id: 'glow', kind: 'p', name: 'WIDE WICK', max: 4, d: () => ['YOUR LIGHT REACHES', '15% FURTHER'] },
+  { id: 'burn', kind: 'p', name: 'SLOW BURN', max: 4, d: () => ['YOUR LANTERN BURNS', '12% SLOWER'] },
+  { id: 'magnet', kind: 'p', name: 'SPARK PULL', max: 3, d: () => ['PULL IN SPARKS FROM', 'FURTHER AWAY'] },
+  { id: 'wings', kind: 'p', name: 'STRONG WINGS', max: 3, d: () => ['EACH FLAP LIFTS', '10% HIGHER'] },
+  { id: 'ward', kind: 'p', name: 'WIND WARD', max: 2, d: () => ['WIND PUSHES YOU', '35% LESS'] },
+  { id: 'breaker', kind: 'p', name: 'BRICK BITER', max: 2,
+    d: l => l === 0 ? ['SMASH THROUGH BRICKS', 'INSTEAD OF BOUNCING'] : ['SMASHING BRICKS NO', 'LONGER COSTS LIGHT'] },
+  { id: 'shield', kind: 'p', name: 'MOTH DUST', max: 4,
+    d: l => l === 0 ? ['A DUST SHIELD BLOCKS', 'ONE HIT. IT RECHARGES.'] : ['SHIELD RECHARGES', 'FASTER'] },
+  { id: 'phoenix', kind: 'p', name: 'PHOENIX WICK', max: 1, d: () => ['WHEN YOUR LIGHT DIES', 'RELIGHT ONCE AT HALF'] },
+  { id: 'bloom', kind: 'p', name: 'SPARK BLOOM', max: 3, d: () => ['MORE SPARKS APPEAR', 'AND EACH GIVES MORE'] },
+];
+const OIL = { id: 'oil', kind: 'o', name: 'FRESH OIL', max: 99, d: () => ['REFILL YOUR LANTERN', 'TO FULL'] };
+UPS.forEach(u => u.icon = u.id);
+OIL.icon = 'oil';
+
+// ===========================================================================
+// Run state
+// ===========================================================================
+let state = 'title', t = 0, buttons = [];
+let moth, camY, ents, foes, bolts, novas, parts, pops;
+let light, maxLight, lightR, invuln, shake, flash;
+let nextY, maxM, sparkCount, kills, overT, emberT, draftId, nextLv;
+let up, choices, lvT, lvHeader, rerolls, shieldReady, shieldT, novaT, boltT, phoenixUsed;
+let waxGain = 0, newBest = false;
+
+function reset() {
+  moth = { x: W / 2, y: 0, vx: 34, vy: 0, flapT: 0 };
+  camY = -H * 0.62;
+  ents = []; foes = []; bolts = []; novas = []; parts = []; pops = [];
+  maxLight = 100 + 10 * meta.perm.wick;
+  light = maxLight; lightR = 76; invuln = 0; shake = 0; flash = 0;
+  nextY = -110; maxM = 0; sparkCount = 0; kills = 0; overT = 0; emberT = 0; draftId = null;
+  nextLv = LEVEL_EVERY;
+  up = {}; UPS.forEach(u => up[u.id] = 0);
+  choices = []; lvT = 0; lvHeader = ''; rerolls = meta.perm.luck;
+  shieldReady = false; shieldT = 0; novaT = 1; boltT = 0.5; phoenixUsed = false;
+  addSpark(W / 2, -60);
+  ensureRows();
+}
+
+const diff = () => clamp(maxM / 1500, 0, 1);
+
+function addSpark(x, y, small) { ents.push({ type: 'spark', x, y, ph: rand(0, 6.28), small: !!small }); }
+
+function pick(opts) {
+  let r = Math.random() * opts.reduce((a, o) => a + o[1], 0);
+  for (const o of opts) { if ((r -= o[1]) <= 0) return o[0]; }
+  return opts[0][0];
+}
+
+function makeBricks(x0, x1) {
+  const arr = [];
+  for (let x = x0; x < x1; x += 8) arr.push({ x, w: Math.min(8, x1 - x), alive: true });
+  return arr;
+}
+
+function spawnFoe(type, y, x) {
+  const d = clamp(-y / PX_PER_M / 1500, 0, 1);
+  if (x === undefined) x = rand(WALL + 10, W - WALL - 10);
+  x = Math.round(x);
+  if (type === 'spider') {
+    foes.push({ type, x, cy: y - 20, y: y - 20, amp: lerp(8, 18, d), sp: lerp(1.5, 2.6, d), ph: rand(0, 6.28) });
+  } else if (type === 'bat') {
+    foes.push({ type, x, y0: y - 15, y: y - 15, vx: (Math.random() < 0.5 ? -1 : 1) * lerp(30, 60, d), ph: rand(0, 6.28) });
+  } else {
+    foes.push({ type: 'wisp', x, y: y - 15, ph: rand(0, 6.28) });
+  }
+}
+
+// One row of challenge at world height y. Hazards unlock with height.
+function spawnRow(y) {
+  const m = -y / PX_PER_M, d = clamp(m / 1500, 0, 1);
+  const opts = [['ledge', 3]];
+  if (m > 50) opts.push(['draft', 0.7 + d]);
+  if (m > 80) opts.push(['spider', 1 + d]);
+  if (m > 150) opts.push(['bat', 1 + d]);
+  if (m > 250) opts.push(['wisp', 0.8 + d]);
+  if (m > 400) opts.push(['swarm', 0.4 + d]);
+  const type = pick(opts);
+
+  if (type === 'ledge') {
+    const gw = Math.round(lerp(46, 28, d) + rand(0, 8));
+    const gx = Math.round(rand(WALL + 4, W - WALL - 4 - gw));
+    ents.push({ type, y: Math.round(y), h: 6, bricks: makeBricks(WALL, gx).concat(makeBricks(gx + gw, W - WALL)) });
+    if (Math.random() < 0.5) addSpark(gx + gw / 2, y - 14);
+  } else if (type === 'draft') {
+    const dirs = ['l', 'r'];
+    if (m > 300) dirs.push('d');
+    const h = 36;
+    ents.push({
+      type, y: y - h, h, dir: dirs[Math.floor(Math.random() * dirs.length)], f: lerp(40, 75, d), id: Math.random(),
+      streaks: Array.from({ length: 8 }, () => ({ x: rand(WALL, W - WALL), y: rand(0, h), l: rand(4, 9) })),
+    });
+  } else if (type === 'spider') {
+    if (d > 0.3 && Math.random() < d) {
+      spawnFoe('spider', y, rand(WALL + 10, W / 2 - 8));
+      spawnFoe('spider', y, rand(W / 2 + 8, W - WALL - 10));
+    } else spawnFoe('spider', y);
+  } else if (type === 'swarm') {
+    for (let i = 0; i < 3; i++) spawnFoe('bat', y - i * 14, rand(WALL + 8, W - WALL - 8));
+  } else {
+    spawnFoe(type, y);
+  }
+
+  // extra roaming foes higher up, so the weapons have work to do
+  if (m > 200 && Math.random() < lerp(0.1, 0.55, d)) spawnFoe(m > 250 && Math.random() < 0.5 ? 'wisp' : 'bat', y - rand(10, 30));
+
+  const gap = lerp(72, 48, d) + rand(0, 22);
+  if (Math.random() < lerp(0.75, 0.4, d) * (1 + 0.25 * (up ? up.bloom : 0))) addSpark(rand(WALL + 8, W - WALL - 8), y - gap / 2);
+  nextY -= gap;
+}
+function ensureRows() { while (nextY > camY - 60) spawnRow(nextY); }
+
+function burst(x, y, n, colors, speed, glow, life = 0.6) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(speed * 0.3, speed);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life,
+      col: colors[Math.floor(Math.random() * colors.length)], glow });
+  }
+}
+function popup(x, y, s, col) { pops.push({ x, y, s, col, life: 1 }); }
+
+// ===========================================================================
+// Actions
+// ===========================================================================
+function startGame() {
+  reset();
+  state = 'play';
+  setMusicLevel(0.2);
+  flap();
+  if (meta.perm.start) openLevelUp('A GIFT TO BEGIN', true);
+}
+function flap() {
+  moth.vy = -FLAP * (1 + 0.1 * (up ? up.wings : 0));
+  moth.flapT = 0.12;
+  sfx.flap();
+  for (let i = 0; i < 2; i++) {
+    parts.push({ x: moth.x + rand(-3, 3), y: moth.y + 2, vx: rand(-10, 10), vy: rand(20, 40),
+      life: 0.35, max: 0.35, col: '#c8b898', glow: false });
+  }
+}
+function hurt(amount, force) {
+  if (invuln > 0 && !force) return;
+  if (!force && up.shield && shieldReady) {
+    shieldReady = false; shieldT = SHIELD_CD[up.shield]; invuln = 0.8;
+    sfx.block();
+    burst(moth.x, moth.y, 12, ['#8ab8ff', '#dceaff'], 50, true);
+    popup(moth.x, moth.y - 8, 'BLOCKED', '#9ac8ff');
+    return;
+  }
+  light -= amount;
+  invuln = 1.1; shake = 4; flash = 0.45;
+  sfx.hit();
+  burst(moth.x, moth.y, 12, ['#ffb84a', '#fff4d0', '#ff7a3a'], 60, true);
+  popup(moth.x, moth.y - 8, '-LIGHT', '#ff7a5a');
+}
+function killFoe(f) {
+  if (f.dead) return;
+  f.dead = true; kills++;
+  sfx.kill();
+  burst(f.x, f.y, 10, f.type === 'wisp' ? ['#c8b8ff', '#ffffff'] : ['#ff8a3a', '#ffd24a', '#fff4d0'], 40, true, 0.5);
+  if (Math.random() < 0.35) addSpark(f.x, f.y, true);
+}
+function breakBrick(b, y) {
+  b.alive = false;
+  burst(b.x + b.w / 2, y + 3, 6, ['#a05a3a', '#6e3a28', '#3a1c14'], 50, false, 0.5);
+}
+function fireNova() {
+  const R = NOVA_R[up.pulse];
+  novas.push({ x: moth.x, y: moth.y, R, age: 0 });
+  sfx.nova();
+  for (const f of foes) if (Math.hypot(f.x - moth.x, f.y - moth.y) < R + 3) killFoe(f);
+  for (const e of ents) {
+    if (e.type !== 'ledge' || Math.abs(e.y - moth.y) > R + 4) continue;
+    for (const b of e.bricks) {
+      if (b.alive && Math.hypot(b.x + b.w / 2 - moth.x, e.y + 3 - moth.y) < R) breakBrick(b, e.y);
+    }
+  }
+}
+function rollChoices() {
+  const pool = UPS.filter(u => up[u.id] < u.max), res = [];
+  while (res.length < 3 && pool.length) {
+    const w = pool.map(u => u.kind === 'w' ? 1.3 : 1);
+    let r = Math.random() * w.reduce((a, b) => a + b, 0), i = 0;
+    for (; i < pool.length - 1; i++) { if ((r -= w[i]) <= 0) break; }
+    res.push(pool.splice(i, 1)[0]);
+  }
+  if (res.length < 3) res.push(OIL);
+  return res;
+}
+function openLevelUp(header, free) {
+  state = 'levelup'; lvT = 0; lvHeader = header;
+  choices = rollChoices();
+  sfx.levelup();
+  setMusicLevel(0.08);
+  if (!free) light = Math.min(maxLight, light + 15);
+}
+function choose(u) {
+  if (u.id === 'oil') light = maxLight;
+  else {
+    up[u.id]++;
+    if (u.id === 'shield') { shieldReady = true; shieldT = 0; }
+    if (u.id === 'pulse') novaT = 1;
+  }
+  sfx.pick();
+  state = 'play';
+  setMusicLevel(0.2);
+  invuln = Math.max(invuln, 0.8);
+  moth.vy = -FLAP;
+  popup(moth.x, moth.y - 12, u.name, '#ffe08a');
+  burst(moth.x, moth.y, 14, ['#ffd24a', '#fff4d0'], 50, true);
+}
+function reroll() {
+  if (rerolls <= 0) { sfx.deny(); return; }
+  rerolls--;
+  choices = rollChoices();
+  lvT = 0.3;
+  sfx.pick();
+}
+function gameOver() {
+  state = 'over'; overT = 0; light = 0;
+  sfx.over();
+  setMusicLevel(0.07);
+  waxGain = Math.floor(maxM / 20) + kills;
+  newBest = Math.floor(maxM) > meta.best;
+  meta.wax += waxGain;
+  meta.best = Math.max(meta.best, Math.floor(maxM));
+  saveMeta();
+}
+function buyPerm(p) {
+  const l = meta.perm[p.id];
+  if (l >= p.max || meta.wax < p.cost[l]) { sfx.deny(); return; }
+  meta.wax -= p.cost[l];
+  meta.perm[p.id]++;
+  saveMeta();
+  sfx.pick();
+}
+
+// ===========================================================================
+// Update
+// ===========================================================================
+function targetR() {
+  const low = light < 25;
+  return (14 + light * 0.62) * (1 + 0.15 * (up ? up.glow : 0))
+    + Math.sin(t * 19) * (low ? 2.5 : 1) + rand(-0.5, 0.5) * (low ? 3 : 1);
+}
+function orbitPos(i) {
+  const n = up.orbit, a = t * (3 + 0.5 * n) + i * Math.PI * 2 / n;
+  return [moth.x + Math.cos(a) * 15, moth.y + 1 + Math.sin(a) * 15];
+}
+
+function updateFx(dt) {
+  for (const p of parts) {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 1 - dt * 2; p.vy *= 1 - dt * 2;
+    p.life -= dt;
+  }
+  parts = parts.filter(p => p.life > 0);
+  for (const p of pops) { p.y -= 16 * dt; p.life -= dt * 0.9; }
+  pops = pops.filter(p => p.life > 0);
+  for (const n of novas) n.age += dt;
+  novas = novas.filter(n => n.age < 0.4);
+  emberT -= dt;
+  if (emberT <= 0 && state !== 'over') {
+    emberT = rand(0.08, 0.2);
+    parts.push({ x: moth.x + rand(-1, 1), y: moth.y + 6, vx: rand(-6, 6), vy: rand(-22, -8),
+      life: 0.6, max: 0.6, col: Math.random() < 0.5 ? '#ffb84a' : '#ffe08a', glow: true });
+  }
+}
+
+function updateWorld(dt) {
+  const d = diff();
+  for (const e of ents) {
+    if (e.type !== 'draft') continue;
+    const v = e.f * 1.6 * dt;
+    for (const s of e.streaks) {
+      if (e.dir === 'l') { s.x -= v; if (s.x < WALL - s.l) s.x = W - WALL; }
+      else if (e.dir === 'r') { s.x += v; if (s.x > W - WALL) s.x = WALL - s.l; }
+      else { s.y += v; if (s.y > e.h) s.y = -s.l; }
+    }
+  }
+  for (const f of foes) {
+    if (f.type === 'spider') f.y = f.cy + Math.sin(t * f.sp + f.ph) * f.amp;
+    else if (f.type === 'bat') {
+      f.x += f.vx * dt;
+      if (f.x < WALL + 5) { f.x = WALL + 5; f.vx = Math.abs(f.vx); }
+      if (f.x > W - WALL - 5) { f.x = W - WALL - 5; f.vx = -Math.abs(f.vx); }
+      f.y = f.y0 + Math.sin(t * 3 + f.ph) * 7;
+    } else if (state === 'play' && Math.abs(f.y - moth.y) < H * 0.7) {
+      const dx = moth.x - f.x, dy = moth.y - f.y, dist = Math.hypot(dx, dy) || 1, sp = lerp(14, 28, d);
+      f.x = clamp(f.x + dx / dist * sp * dt + Math.sin(t * 2 + f.ph) * 10 * dt, WALL + 4, W - WALL - 4);
+      f.y += dy / dist * sp * dt;
+    }
+  }
+}
+
+function update(dt) {
+  t += dt;
+  if (state === 'levelup') { lvT += dt; return; }
+  shake = Math.max(0, shake - dt * 12);
+  flash = Math.max(0, flash - dt * 2.5);
+  invuln = Math.max(0, invuln - dt);
+  moth.flapT = Math.max(0, moth.flapT - dt);
+
+  if (state === 'title' || state === 'shop') {
+    moth.y = Math.sin(t * 2.2) * 4;
+    updateWorld(dt); updateFx(dt);
+    lightR = targetR();
+    return;
+  }
+  if (state === 'over') {
+    overT += dt;
+    moth.vy = Math.min(moth.vy + GRAV * dt, MAXFALL);
+    moth.y += moth.vy * dt;
+    lightR = Math.max(0, lightR - dt * 80);
+    updateWorld(dt); updateFx(dt);
+    return;
+  }
+
+  // ---------------- play ----------------
+  const d = diff();
+  updateWorld(dt);
+
+  moth.vy = Math.min(moth.vy + GRAV * dt, MAXFALL);
+  moth.vx = Math.sign(moth.vx || 1) * (32 + d * 16);
+
+  let ex = 0, inDraft = null;
+  const ward = 1 - 0.35 * up.ward;
+  for (const e of ents) {
+    if (e.type !== 'draft' || moth.y < e.y || moth.y > e.y + e.h) continue;
+    inDraft = e.id;
+    if (e.dir === 'l') ex -= e.f * ward;
+    else if (e.dir === 'r') ex += e.f * ward;
+    else moth.vy += e.f * 3 * ward * dt;
+  }
+  if (inDraft !== null && inDraft !== draftId) sfx.whoosh();
+  draftId = inDraft;
+
+  moth.x += (moth.vx + ex) * dt;
+  moth.y += moth.vy * dt;
+  if (moth.x < WALL + 4) { moth.x = WALL + 4; moth.vx = Math.abs(moth.vx); }
+  if (moth.x > W - WALL - 4) { moth.x = W - WALL - 4; moth.vx = -Math.abs(moth.vx); }
+
+  const mb = () => [moth.x - 3, moth.y - 3, 7, 8];
+
+  // ledges, brick by brick
+  for (const e of ents) {
+    if (e.type !== 'ledge' || e.y > moth.y + 10 || e.y + e.h < moth.y - 10) continue;
+    let smashed = false, hit = false;
+    for (const b of e.bricks) {
+      if (!b.alive) continue;
+      const [bx, by, bw, bh] = mb();
+      if (!overlap(bx, by, bw, bh, b.x, e.y, b.w, e.h)) continue;
+      const ox = Math.min(bx + bw - b.x, b.x + b.w - bx);
+      const oy = Math.min(by + bh - e.y, e.y + e.h - by);
+      if (oy < ox && moth.y < e.y + e.h / 2) {      // standing on top is safe
+        moth.y -= oy; if (moth.vy > 0) moth.vy = 0;
+        continue;
+      }
+      if (up.breaker) { breakBrick(b, e.y); smashed = true; continue; }
+      if (oy < ox) { moth.y += oy; moth.vy = Math.max(moth.vy, 40); }
+      else { moth.x += bx < b.x ? -ox : ox; moth.vx = -moth.vx; }
+      hit = true;
+    }
+    if (smashed) {
+      sfx.smash(); shake = Math.max(shake, 2);
+      if (up.breaker < 2) light -= 6;
+    }
+    if (hit) hurt(20);
+  }
+
+  // weapons
+  if (up.bolt) {
+    boltT -= dt;
+    if (boltT <= 0) {
+      const targets = foes
+        .filter(f => !f.dead && f.y > camY - 10 && f.y < camY + H && Math.hypot(f.x - moth.x, f.y - moth.y) < 120)
+        .sort((a, b) => Math.hypot(a.x - moth.x, a.y - moth.y) - Math.hypot(b.x - moth.x, b.y - moth.y));
+      if (targets.length) {
+        for (let i = 0; i < BOLT_N[up.bolt]; i++) {
+          const f = targets[i % targets.length];
+          const a = Math.atan2(f.y - moth.y, f.x - moth.x) + (i >= targets.length ? rand(-0.25, 0.25) : 0);
+          bolts.push({ x: moth.x, y: moth.y, vx: Math.cos(a) * 170, vy: Math.sin(a) * 170, life: 0.9 });
+        }
+        sfx.bolt();
+        boltT = BOLT_CD[up.bolt];
+      } else boltT = 0.1;
+    }
+  }
+  for (const b of bolts) {
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (Math.random() < 0.6) parts.push({ x: b.x, y: b.y, vx: 0, vy: 0, life: 0.2, max: 0.2, col: '#ff8a3a', glow: true });
+    for (const f of foes) {
+      if (!f.dead && Math.hypot(f.x - b.x, f.y - b.y) < 6) { killFoe(f); b.life = 0; break; }
+    }
+  }
+  bolts = bolts.filter(b => b.life > 0 && b.x > 0 && b.x < W);
+  if (up.orbit) {
+    for (let i = 0; i < up.orbit; i++) {
+      const [ox, oy] = orbitPos(i);
+      for (const f of foes) if (!f.dead && Math.hypot(f.x - ox, f.y - oy) < 6) killFoe(f);
+    }
+  }
+  if (up.pulse) {
+    novaT -= dt;
+    if (novaT <= 0) { novaT = NOVA_CD[up.pulse]; fireNova(); }
+  }
+  if (up.shield && !shieldReady) {
+    shieldT -= dt;
+    if (shieldT <= 0) { shieldReady = true; popup(moth.x, moth.y - 10, 'SHIELD', '#9ac8ff'); }
+  }
+
+  // creatures
+  for (const f of foes) {
+    if (f.dead || invuln > 0) continue;
+    const [bx, by, bw, bh] = mb();
+    const box = f.type === 'spider' ? [f.x - 3, f.y - 2, 7, 5] : f.type === 'bat' ? [f.x - 4, f.y - 2, 9, 4] : [f.x - 3, f.y - 3, 7, 6];
+    if (overlap(bx, by, bw, bh, ...box)) { hurt(20); moth.vy = 70; }
+  }
+
+  // sparks
+  const pullR = up.magnet ? 16 + 16 * up.magnet : 0;
+  for (const e of ents) {
+    if (e.type !== 'spark') continue;
+    const sy = e.pulled ? e.y : e.y + Math.sin(t * 3 + e.ph) * 2;
+    const dx = moth.x - e.x, dy = moth.y + 1 - sy, dist = Math.hypot(dx, dy);
+    if (pullR && dist < pullR) {
+      e.pulled = true;
+      e.x += dx / (dist || 1) * 140 * dt; e.y = sy + dy / (dist || 1) * 140 * dt;
+    }
+    if (Math.abs(dx) < 7 && Math.abs(dy) < 8) {
+      e.dead = true;
+      light = Math.min(maxLight, light + (e.small ? 6 : 14) + 3 * up.bloom);
+      sparkCount++;
+      sfx.spark();
+      burst(e.x, sy, 10, ['#ffd24a', '#fff4d0', '#ff9a3a'], 45, true, 0.5);
+      popup(e.x, sy - 6, '+' + ((e.small ? 6 : 14) + 3 * up.bloom), '#ffe08a');
+    }
+  }
+  ents = ents.filter(e => !e.dead);
+  foes = foes.filter(f => !f.dead);
+
+  if (moth.y > camY + H + 6) {
+    moth.y = camY + H + 6;
+    moth.vy = -260;
+    hurt(20, true);
+  }
+
+  light -= (3.2 + d * 5.5) * (1 - 0.12 * up.burn) * (1 - 0.05 * meta.perm.oil) * dt;
+  if (light <= 0) {
+    if (up.phoenix && !phoenixUsed) {
+      phoenixUsed = true;
+      light = maxLight / 2; invuln = 2; flash = 0.6; shake = 5;
+      sfx.reborn();
+      burst(moth.x, moth.y, 30, ['#ff8a3a', '#ffd24a', '#fff4d0'], 80, true, 0.9);
+      popup(moth.x, moth.y - 12, 'REBORN!', '#ffb84a');
+    } else { gameOver(); return; }
+  }
+  lightR = targetR();
+
+  const target = moth.y - H * 0.62;
+  if (target < camY) camY += (target - camY) * Math.min(1, dt * 8);
+  maxM = Math.max(maxM, -moth.y / PX_PER_M);
+
+  ensureRows();
+  const keep = y => y > camY - 400 && y < camY + H + 80;
+  ents = ents.filter(e => keep(e.type === 'draft' ? e.y + e.h : e.y + 10));
+  foes = foes.filter(f => keep(f.type === 'spider' ? f.cy + 30 : f.y + 10));
+  updateFx(dt);
+
+  if (maxM >= nextLv) {
+    openLevelUp(nextLv + 'M REACHED', false);
+    nextLv += LEVEL_EVERY;
+  }
+}
+
+// ===========================================================================
+// Render
+// ===========================================================================
+function drawBrick(x, y, w, h) {
+  ctx.fillStyle = '#6e3a28'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = '#a05a3a'; ctx.fillRect(x, y, w, 1);
+  ctx.fillStyle = '#3a1c14'; ctx.fillRect(x, y + h - 1, w, 1);
+  ctx.fillStyle = '#44201a';
+  ctx.fillRect(x, y + 3, w, 1);
+  ctx.fillRect(x + w - 1, y + 1, 1, 2);
+  if (w > 4) ctx.fillRect(x + 3, y + 4, 1, 1);
+}
+function hole(x, y, r) {
+  if (r <= 0) return;
+  const g = dctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.55, 'rgba(0,0,0,1)');
+  g.addColorStop(0.55, 'rgba(0,0,0,0.7)'); g.addColorStop(0.76, 'rgba(0,0,0,0.7)');
+  g.addColorStop(0.76, 'rgba(0,0,0,0.35)'); g.addColorStop(0.9, 'rgba(0,0,0,0.35)');
+  g.addColorStop(0.9, 'rgba(0,0,0,0)');
+  dctx.fillStyle = g;
+  dctx.beginPath(); dctx.arc(x, y, r, 0, Math.PI * 2); dctx.fill();
+}
+function button(x, y, w, h, label, fn, col = '#ecdcb4', bg = '#1a1220') {
+  ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+  ctx.fillStyle = col; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = bg; ctx.fillRect(x + 1, y + 1, w - 2, h - 2);
+  text(label, x + w / 2, y + Math.round((h - 5) / 2), 1, col, 'center');
+  buttons.push({ x, y, w, h, fn });
+}
+
+function render() {
+  buttons = [];
+  const sx = shake > 0 ? Math.round(rand(-shake, shake)) : 0;
+  const sy = shake > 0 ? Math.round(rand(-shake, shake)) : 0;
+  const cy = Math.round(camY);
+  const toWorld = () => ctx.setTransform(1, 0, 0, 1, sx, -cy + sy);
+  const playing = state === 'play' || state === 'levelup';
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#07050c'; ctx.fillRect(0, 0, W, H);
+
+  // ---- lit world ----
+  toWorld();
+  ctx.fillStyle = patBack; ctx.fillRect(-8, cy - 8, W + 16, H + 16);
+  for (const e of ents) {
+    if (e.type === 'ledge') for (const b of e.bricks) if (b.alive) drawBrick(b.x, e.y, b.w, e.h);
+  }
+  for (const f of foes) {
+    const fx = Math.round(f.x), fy = Math.round(f.y);
+    if (f.type === 'spider') {
+      ctx.fillStyle = '#9a8aa8'; ctx.fillRect(fx, cy - 8, 1, fy - cy + 6);
+      ctx.drawImage(SPIDER, fx - 3, fy - 2);
+    } else if (f.type === 'bat') {
+      ctx.drawImage(Math.floor(t * 8 + f.ph) % 2 ? BAT_A : BAT_B, fx - 5, fy - 2);
+    } else {
+      ctx.drawImage(WISP, fx - 3, fy - 3 + (Math.floor(t * 4 + f.ph) % 2));
+    }
+  }
+  ctx.fillStyle = patWall;
+  ctx.fillRect(-8, cy - 8, WALL + 8, H + 16);
+  ctx.fillRect(W - WALL, cy - 8, WALL + 8, H + 16);
+  ctx.fillStyle = '#1a0c08';
+  ctx.fillRect(WALL, cy - 8, 1, H + 16);
+  ctx.fillRect(W - WALL - 1, cy - 8, 1, H + 16);
+
+  if (!(invuln > 0 && state === 'play' && Math.floor(t * 20) % 2)) {
+    const fr = state === 'over' ? MOTH_A : (moth.flapT > 0 || Math.floor(t * 9) % 2 ? MOTH_B : MOTH_A);
+    ctx.drawImage(fr, Math.round(moth.x) - 4, Math.round(moth.y) - 4);
+  }
+  for (const p of parts) {
+    if (p.glow) continue;
+    ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 1);
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- darkness ----
+  dctx.globalCompositeOperation = 'source-over';
+  dctx.clearRect(0, 0, W, H);
+  dctx.fillStyle = 'rgba(7,5,12,0.97)';
+  dctx.fillRect(0, 0, W, H);
+  dctx.globalCompositeOperation = 'destination-out';
+  const lx = Math.round(moth.x) + sx, ly = Math.round(moth.y) + 3 - cy + sy;
+  hole(lx, ly, lightR);
+  for (const e of ents) if (e.type === 'spark') hole(e.x + sx, e.y - cy + sy, e.small ? 6 : 9);
+  if (playing && up.orbit) for (let i = 0; i < up.orbit; i++) { const [ox, oy] = orbitPos(i); hole(ox + sx, oy - cy + sy, 9); }
+  for (const b of bolts) hole(b.x + sx, b.y - cy + sy, 6);
+  for (const n of novas) hole(n.x + sx, n.y - cy + sy, n.R * Math.min(1, n.age / 0.2) * (1 - n.age / 0.4) + 4);
+  dctx.globalCompositeOperation = 'source-over';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(dark, 0, 0);
+  if (lightR > 2) {
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(lx, ly, 0, lx, ly, lightR);
+    g.addColorStop(0, 'rgba(255,170,70,0.22)'); g.addColorStop(1, 'rgba(255,170,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // ---- things that shine through the dark ----
+  toWorld();
+  const topM = Math.floor(-cy / PX_PER_M / 100) * 100;
+  for (let m = topM; m > topM - 400 && m > 0; m -= 100) {
+    const y = -m * PX_PER_M;
+    if (y < cy + 24 || y > cy + H + 8) continue;
+    const gift = m % LEVEL_EVERY === 0;
+    ctx.fillStyle = gift ? 'rgba(154,224,255,0.4)' : 'rgba(255,220,160,0.22)';
+    for (let x = WALL + 1; x < W - WALL - 1; x += 4) ctx.fillRect(x, y, 2, 1);
+    ctx.globalAlpha = gift ? 0.8 : 0.5;
+    text(m + 'M', W - WALL - 2, y - 7, 1, gift ? '#9ae0ff' : '#ffdca0', 'right', null);
+    ctx.globalAlpha = 1;
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(WALL, cy - 8, W - 2 * WALL, H + 16); ctx.clip();
+  for (const e of ents) {
+    if (e.type !== 'draft') continue;
+    ctx.fillStyle = 'rgba(150,180,255,0.035)'; ctx.fillRect(WALL, e.y, W - 2 * WALL, e.h);
+    ctx.fillStyle = 'rgba(190,210,255,0.4)';
+    for (const s of e.streaks) {
+      if (e.dir === 'd') ctx.fillRect(Math.round(s.x), Math.round(e.y + s.y), 1, Math.round(s.l));
+      else ctx.fillRect(Math.round(s.x), Math.round(e.y + s.y), Math.round(s.l), 1);
+    }
+  }
+  ctx.restore();
+  for (const f of foes) {
+    const fx = Math.round(f.x), fy = Math.round(f.y);
+    if (f.type === 'spider') {
+      ctx.fillStyle = '#ff4a4a'; ctx.fillRect(fx - 2, fy, 1, 1); ctx.fillRect(fx, fy, 1, 1);
+    } else if (f.type === 'bat') {
+      const ey = fy - 2 + (Math.floor(t * 8 + f.ph) % 2 ? 3 : 2);
+      ctx.fillStyle = '#ff5a3a'; ctx.fillRect(fx - 1, ey, 1, 1); ctx.fillRect(fx + 1, ey, 1, 1);
+    } else {
+      const ey = fy - 1 + (Math.floor(t * 4 + f.ph) % 2);
+      ctx.fillStyle = '#e8c8ff'; ctx.fillRect(fx - 2, ey, 1, 1); ctx.fillRect(fx + 2, ey, 1, 1);
+    }
+  }
+  for (const e of ents) {
+    if (e.type !== 'spark') continue;
+    const y = Math.round(e.pulled ? e.y : e.y + Math.sin(t * 3 + e.ph) * 2), x = Math.round(e.x);
+    const on = Math.floor(t * 10 + e.ph) % 2;
+    ctx.fillStyle = on ? '#ff9a3a' : '#ffd24a';
+    ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3);
+    if (on && !e.small) { ctx.fillRect(x - 2, y, 1, 1); ctx.fillRect(x + 2, y, 1, 1); ctx.fillRect(x, y - 2, 1, 1); ctx.fillRect(x, y + 2, 1, 1); }
+    ctx.fillStyle = '#fff8e0'; ctx.fillRect(x, y, 1, 1);
+  }
+  if (playing) {
+    if (up.orbit) {
+      for (let i = 0; i < up.orbit; i++) {
+        const [ox, oy] = orbitPos(i), x = Math.round(ox), y = Math.round(oy);
+        ctx.fillStyle = Math.floor(t * 12 + i) % 2 ? '#ff8a3a' : '#ffb84a';
+        ctx.fillRect(x - 1, y - 1, 3, 3);
+        ctx.fillStyle = '#fff4d0'; ctx.fillRect(x, y, 1, 1);
+      }
+    }
+    if (up.shield && shieldReady) {
+      ctx.fillStyle = 'rgba(160,200,255,0.55)';
+      for (let i = 0; i < 12; i++) {
+        const a = i / 12 * Math.PI * 2 + t;
+        ctx.fillRect(Math.round(moth.x + Math.cos(a) * 8), Math.round(moth.y + 1 + Math.sin(a) * 8), 1, 1);
+      }
+    }
+  }
+  for (const b of bolts) {
+    ctx.fillStyle = '#ffd24a'; ctx.fillRect(Math.round(b.x) - 1, Math.round(b.y) - 1, 2, 2);
+  }
+  for (const n of novas) {
+    const r = n.R * Math.min(1, n.age / 0.2);
+    ctx.globalAlpha = 1 - n.age / 0.4;
+    ctx.strokeStyle = '#bfe4ff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  if (state !== 'over' || lightR > 0) {
+    ctx.fillStyle = '#ffd24a';
+    ctx.fillRect(Math.round(moth.x), Math.round(moth.y) + 3, 1, 1);
+  }
+  for (const p of parts) {
+    if (!p.glow) continue;
+    ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 1);
+  }
+  ctx.globalAlpha = 1;
+  for (const p of pops) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    text(p.s, clamp(p.x, 20, W - 20), Math.round(p.y), 1, p.col, 'center');
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- screen space ----
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (flash > 0) { ctx.fillStyle = `rgba(255,120,80,${flash * 0.5})`; ctx.fillRect(0, 0, W, H); }
+  if (state === 'play') drawHud();
+  else if (state === 'levelup') { drawHud(); drawLevelUp(); }
+  else if (state === 'title') drawTitle();
+  else if (state === 'shop') drawShop();
+  else drawOver();
+  drawMute();
+}
+
+function drawHud() {
+  ctx.fillStyle = '#000'; ctx.fillRect(4, 3, 5, 8);
+  ctx.fillStyle = '#8a7a6a'; ctx.fillRect(5, 3, 3, 1);
+  ctx.fillStyle = '#6a5040'; ctx.fillRect(4, 4, 4, 6);
+  ctx.fillStyle = '#ffd24a'; ctx.fillRect(5, 5, 2, 4);
+  const low = light < 25, blink = low && Math.floor(t * 6) % 2;
+  ctx.fillStyle = blink ? '#ff4a3a' : '#000'; ctx.fillRect(10, 4, 42, 6);
+  ctx.fillStyle = '#2a1a24'; ctx.fillRect(11, 5, 40, 4);
+  const w = Math.max(0, Math.round(40 * light / maxLight));
+  ctx.fillStyle = light > 50 ? '#ffd24a' : light > 25 ? '#ff9a3a' : '#ff4a3a';
+  ctx.fillRect(11, 5, w, 4);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillRect(11, 5, w, 1);
+  text(Math.floor(maxM) + 'M', W / 2 + 10, 4, 1, '#fff', 'center');
+
+  // progress to the next gift
+  const k = clamp((maxM - (nextLv - LEVEL_EVERY)) / LEVEL_EVERY, 0, 1);
+  ctx.fillStyle = '#000'; ctx.fillRect(3, 12, W - 6, 4);
+  ctx.fillStyle = '#1a2030'; ctx.fillRect(4, 13, W - 8, 2);
+  ctx.fillStyle = '#9ae0ff'; ctx.fillRect(4, 13, Math.round((W - 8) * k), 2);
+
+  // owned gifts
+  const owned = UPS.filter(u => up[u.id] > 0);
+  owned.forEach((u, i) => {
+    const x = 4 + i * 10, y = H - 13;
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1, 9, 12);
+    ctx.globalAlpha = u.id === 'shield' && !shieldReady ? 0.35 : u.id === 'phoenix' && phoenixUsed ? 0.25 : 1;
+    ctx.drawImage(ICONS[u.icon], x, y);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#3a3040'; ctx.fillRect(x, y + 8, 7, 1);
+    ctx.fillStyle = u.kind === 'w' ? '#ff9a3a' : '#8ab8ff';
+    ctx.fillRect(x, y + 8, Math.max(1, Math.round(7 * up[u.id] / u.max)), 1);
+  });
+}
+
+function drawMute() {
+  const x = W - 14, y = 4;
+  ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1, 12, 9);
+  ctx.fillStyle = '#ecdcb4';
+  ctx.fillRect(x, y + 2, 2, 3); ctx.fillRect(x + 2, y + 1, 1, 5); ctx.fillRect(x + 3, y, 1, 7);
+  if (muted) {
+    ctx.fillStyle = '#ff5a4a';
+    for (let i = 0; i < 4; i++) { ctx.fillRect(x + 5 + i, y + 1 + i, 1, 1); ctx.fillRect(x + 8 - i, y + 1 + i, 1, 1); }
+  } else {
+    ctx.fillRect(x + 5, y + 2, 1, 3); ctx.fillRect(x + 7, y + 1, 1, 5); ctx.fillRect(x + 9, y, 1, 7);
+  }
+  buttons.push({ x: W - 22, y: 0, w: 22, h: 18, fn: toggleMute });
+}
+
+function drawLevelUp() {
+  ctx.fillStyle = 'rgba(7,5,12,0.72)'; ctx.fillRect(0, 0, W, H);
+  const ch = 42, gap = 5, top = Math.round((H - 180) / 2) + 30;
+  text(lvHeader, W / 2, top - 26, 1, '#9ae0ff', 'center');
+  text('CHOOSE A GIFT', W / 2, top - 16, 2, '#ffd24a', 'center', '#5a2a10');
+  choices.forEach((u, i) => {
+    const x = 8, y = top + i * (ch + gap), w = W - 16;
+    const a = clamp((lvT - 0.08 * i) / 0.25, 0, 1);
+    const col = u.kind === 'w' ? '#ff9a3a' : u.kind === 'p' ? '#8ab8ff' : '#ffd24a';
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1 + Math.round((1 - a) * 6), w + 2, ch + 2);
+    const yy = y + Math.round((1 - a) * 6);
+    ctx.fillStyle = col; ctx.fillRect(x, yy, w, ch);
+    ctx.fillStyle = '#1a1220'; ctx.fillRect(x + 1, yy + 1, w - 2, ch - 2);
+    ctx.fillStyle = '#2a1e30'; ctx.fillRect(x + 4, yy + 4, 16, 16);
+    ctx.drawImage(ICONS[u.icon], x + 5, yy + 5, 14, 14);
+    text(u.name, x + 24, yy + 5, 1, '#fff');
+    const lvl = u.id === 'oil' ? '' : up[u.id] === 0 ? 'NEW' : 'LV ' + (up[u.id] + 1);
+    text(lvl, x + w - 4, yy + 5, 1, up[u.id] === 0 ? '#ffd24a' : '#c8b0a0', 'right');
+    u.d(up[u.id] || 0).forEach((line, j) => text(line, x + 24, yy + 15 + j * 8, 1, '#c8b0a0', 'left', null));
+    text(u.kind === 'w' ? 'WEAPON' : u.kind === 'p' ? 'PASSIVE' : 'REFILL', x + 24, yy + 33, 1, col, 'left', null);
+    ctx.globalAlpha = 1;
+    if (lvT > 0.45) buttons.push({ x, y, w, h: ch, fn: () => choose(u) });
+  });
+  if (rerolls > 0 && lvT > 0.45) {
+    button(W / 2 - 30, top + 3 * (ch + gap) + 1, 60, 13, 'REROLL ' + rerolls, reroll, '#9ae0ff');
+  }
+}
+
+function drawTitle() {
+  const y0 = Math.round(H * 0.11);
+  text('LANTERN', W / 2, y0, 3, '#ffd24a', 'center', '#5a2a10');
+  text('MOTH II', W / 2, y0 + 20, 3, '#ecdcb4', 'center', '#3a2a1a');
+  text('EVERY 200M CHOOSE A GIFT', W / 2, y0 + 44, 1, '#9ae0ff', 'center');
+  const yb = Math.round(H * 0.66);
+  text('TAP TO FLAP', W / 2, yb, 1, '#ecdcb4', 'center');
+  text('SPARKS KEEP YOUR LIGHT ALIVE', W / 2, yb + 9, 1, '#ffb84a', 'center');
+  if (Math.floor(t * 2.5) % 2) text('TAP TO START', W / 2, yb + 23, 1, '#fff', 'center');
+  if (meta.best) text('BEST ' + meta.best + 'M', W / 2, yb + 34, 1, '#c8b0a0', 'center');
+  button(W / 2 - 48, H - 24, 96, 15, 'UPGRADES  WAX ' + meta.wax, () => { state = 'shop'; sfx.pick(); }, '#ffd24a');
+}
+
+function drawShop() {
+  ctx.fillStyle = 'rgba(7,5,12,0.85)'; ctx.fillRect(0, 0, W, H);
+  text('UPGRADES', W / 2, 14, 2, '#ffd24a', 'center', '#5a2a10');
+  text('WAX ' + meta.wax, W / 2, 30, 1, '#fff', 'center');
+  PERMS.forEach((p, i) => {
+    const x = 8, y = 42 + i * 36, w = W - 16, h = 32;
+    const l = meta.perm[p.id], maxed = l >= p.max, cost = maxed ? 0 : p.cost[l], afford = !maxed && meta.wax >= cost;
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+    ctx.fillStyle = maxed ? '#5aa06a' : afford ? '#ffd24a' : '#4a3a4a'; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#1a1220'; ctx.fillRect(x + 1, y + 1, w - 2, h - 2);
+    ctx.fillStyle = '#2a1e30'; ctx.fillRect(x + 4, y + 4, 16, 16);
+    ctx.drawImage(ICONS[p.icon], x + 5, y + 5, 14, 14);
+    text(p.name, x + 24, y + 4, 1, '#fff');
+    text(l + '/' + p.max, x + w - 4, y + 4, 1, '#c8b0a0', 'right');
+    text(p.desc, x + 24, y + 13, 1, '#c8b0a0', 'left', null);
+    text(maxed ? 'MAXED' : 'COST ' + cost + ' WAX', x + 24, y + 22, 1, maxed ? '#7ad08a' : afford ? '#ffd24a' : '#806070', 'left', null);
+    buttons.push({ x, y, w, h, fn: () => buyPerm(p) });
+  });
+  text('EARN WAX FROM HEIGHT', W / 2, 42 + 4 * 36 + 2, 1, '#806070', 'center', null);
+  text('AND FOES BURNED', W / 2, 42 + 4 * 36 + 10, 1, '#806070', 'center', null);
+  button(W / 2 - 24, H - 20, 48, 14, 'BACK', () => { state = 'title'; sfx.pick(); });
+}
+
+function drawOver() {
+  if (overT < 0.7) return;
+  ctx.fillStyle = 'rgba(7,5,12,0.65)'; ctx.fillRect(0, 0, W, H);
+  const y0 = Math.round(H * 0.14);
+  text('THE LIGHT', W / 2, y0, 2, '#ff9a3a', 'center', '#3a1408');
+  text('WENT OUT', W / 2, y0 + 14, 2, '#ff9a3a', 'center', '#3a1408');
+  const rows = [
+    ['HEIGHT', Math.floor(maxM) + 'M', '#fff'],
+    ['SPARKS', sparkCount, '#ffd24a'],
+    ['FOES BURNED', kills, '#ff9a3a'],
+    ['GIFTS', UPS.reduce((a, u) => a + up[u.id], 0), '#9ae0ff'],
+  ];
+  rows.forEach(([k, v, c], i) => {
+    text(k, 26, y0 + 38 + i * 10, 1, '#c8b0a0');
+    text(String(v), W - 26, y0 + 38 + i * 10, 1, c, 'right');
+  });
+  ctx.fillStyle = '#5a4050'; ctx.fillRect(26, y0 + 79, W - 52, 1);
+  text('WAX EARNED', 26, y0 + 84, 1, '#ecdcb4');
+  text('+' + waxGain, W - 26, y0 + 84, 1, '#ffd24a', 'right');
+  text('BEST', 26, y0 + 94, 1, '#ecdcb4');
+  text(meta.best + 'M', W - 26, y0 + 94, 1, '#fff', 'right');
+  if (newBest) text('NEW BEST!', W / 2, y0 + 108, 1, '#9ae0ff', 'center');
+  if (overT > 1) {
+    if (Math.floor(t * 2.5) % 2) text('TAP TO RETRY', W / 2, H - 46, 1, '#fff', 'center');
+    button(W / 2 - 48, H - 24, 96, 15, 'UPGRADES  WAX ' + meta.wax, () => { state = 'shop'; sfx.pick(); }, '#ffd24a');
+  }
+}
+
+// ===========================================================================
+// Input: one tap. Buttons and cards are tapped too.
+// ===========================================================================
+function press(px, py) {
+  initAudio();
+  if (px !== undefined) {
+    for (let i = buttons.length - 1; i >= 0; i--) {
+      const b = buttons[i];
+      if (px >= b.x && px < b.x + b.w && py >= b.y && py < b.y + b.h) { b.fn(); return; }
+    }
+  }
+  if (state === 'title') startGame();
+  else if (state === 'play') flap();
+  else if (state === 'over' && overT > 1) startGame();
+}
+window.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  press((e.clientX - r.left) / r.width * W, (e.clientY - r.top) / r.height * H);
+}, { passive: false });
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (state === 'levelup' && lvT > 0.45) {
+    const n = ['Digit1', 'Digit2', 'Digit3'].indexOf(e.code);
+    if (n >= 0 && choices[n]) { choose(choices[n]); return; }
+    if (e.code === 'KeyR') { reroll(); return; }
+  }
+  if (state === 'shop' && (e.code === 'Escape' || e.code === 'Backspace')) { state = 'title'; return; }
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Enter') { e.preventDefault(); press(); }
+  else if (e.code === 'KeyM') { initAudio(); toggleMute(); }
+});
+['touchstart', 'touchmove', 'gesturestart', 'contextmenu', 'dblclick'].forEach(ev =>
+  window.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+
+// ===========================================================================
+// Main loop
+// ===========================================================================
+reset();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(1 / 30, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
