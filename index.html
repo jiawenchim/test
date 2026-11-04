@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07050c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Lantern Moth</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #07050c; overflow: hidden;
+    overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Constants & setup
+// ---------------------------------------------------------------------------
+const W = 144;            // internal width in pixels (height adapts to screen)
+const WALL = 10;          // chimney wall thickness
+const PX_PER_M = 4;       // world pixels per metre climbed
+const GRAV = 320, FLAP = 125, MAXFALL = 170;
+let H = 256;
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const dark = document.createElement('canvas');
+const dctx = dark.getContext('2d');
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  H = Math.round(Math.min(320, Math.max(220, W * vh / vw)));
+  cv.width = W; cv.height = H; dark.width = W; dark.height = H;
+  const scale = Math.min(vw / W, vh / H);
+  cv.style.width = Math.floor(W * scale) + 'px';
+  cv.style.height = Math.floor(H * scale) + 'px';
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ---------------------------------------------------------------------------
+// Pixel art
+// ---------------------------------------------------------------------------
+function sprite(rows, pal) {
+  const c = document.createElement('canvas');
+  c.width = rows[0].length; c.height = rows.length;
+  const x = c.getContext('2d');
+  rows.forEach((r, j) => [...r].forEach((ch, i) => {
+    if (pal[ch]) { x.fillStyle = pal[ch]; x.fillRect(i, j, 1, 1); }
+  }));
+  return c;
+}
+
+const MOTH_PAL = { w: '#ecdcb4', W: '#b89a6a', b: '#7a5534', a: '#9a7550', l: '#8a7a6a', L: '#4a3626', Y: '#ffd24a' };
+const MOTH_A = sprite([
+  'ww.a.a.ww',
+  'wWw.b.wWw',
+  'wWWbbbWWw',
+  '.wwbbbww.',
+  '...bbb...',
+  '....l....',
+  '...LLL...',
+  '...LYL...',
+  '...LLL...',
+], MOTH_PAL);
+const MOTH_B = sprite([
+  '...a.a...',
+  '....b....',
+  '..wbbbw..',
+  'wWWbbbWWw',
+  'wWw.b.wWw',
+  'ww..l..ww',
+  '...LLL...',
+  '...LYL...',
+  '...LLL...',
+], MOTH_PAL);
+
+const SPIDER = sprite([
+  '..k.k..',
+  'k.kkk.k',
+  '.kRkRk.',
+  'k.kkk.k',
+  '..k.k..',
+], { k: '#7a5a8a', R: '#ff4a4a' });
+
+const BAT_PAL = { k: '#5a4a6a', R: '#ff5a3a' };
+const BAT_A = sprite([
+  'k.........k',
+  'kk..k.k..kk',
+  'kkkkkkkkkkk',
+  '..kkRkRkk..',
+  '....kkk....',
+], BAT_PAL);
+const BAT_B = sprite([
+  '....k.k....',
+  '..kkkkkkk..',
+  'kkkkRkRkkkk',
+  'kk..kkk..kk',
+  'k.........k',
+], BAT_PAL);
+
+function brickTile(c1, c2, mortar, seed) {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 8;
+  const x = c.getContext('2d');
+  x.fillStyle = mortar; x.fillRect(0, 0, 16, 8);
+  const brick = (bx, by) => {
+    x.fillStyle = c1; x.fillRect(bx, by, 7, 3);
+    x.fillStyle = c2; x.fillRect(bx, by + 2, 7, 1);
+  };
+  brick(0, 0); brick(8, 0); brick(-4, 4); brick(4, 4); brick(12, 4);
+  let s = seed;
+  for (let i = 0; i < 6; i++) {
+    s = (s * 9301 + 49297) % 233280; const px = s % 16;
+    s = (s * 9301 + 49297) % 233280; const py = s % 8;
+    x.fillStyle = c2; x.fillRect(px, py, 1, 1);
+  }
+  return c;
+}
+const patBack = ctx.createPattern(brickTile('#3a2028', '#2c1820', '#1a0e14', 7), 'repeat');
+const patWall = ctx.createPattern(brickTile('#5a3226', '#45251c', '#24130e', 3), 'repeat');
+
+// 3x5 bitmap font: each glyph is 5 rows, each row a 3-bit number (4 = left pixel)
+const FONT = {
+  '0': '75557', '1': '26227', '2': '71747', '3': '71317', '4': '55711',
+  '5': '74717', '6': '74757', '7': '71122', '8': '75757', '9': '75717',
+  'A': '25755', 'B': '65656', 'C': '34443', 'D': '65556', 'E': '74647',
+  'F': '74644', 'G': '34553', 'H': '55755', 'I': '72227', 'J': '11152',
+  'K': '55655', 'L': '44447', 'M': '57755', 'N': '65555', 'O': '25552',
+  'P': '65644', 'Q': '25563', 'R': '65655', 'S': '34216', 'T': '72222',
+  'U': '55557', 'V': '55552', 'W': '55775', 'X': '55255', 'Y': '55222',
+  'Z': '71247', ' ': '00000', '+': '02720', '-': '00700', ':': '02020',
+  '.': '00002', '!': '22202',
+};
+function drawGlyphs(s, x, y, sc, col) {
+  ctx.fillStyle = col;
+  for (let i = 0; i < s.length; i++) {
+    const g = FONT[s[i]];
+    if (!g) continue;
+    for (let r = 0; r < 5; r++) {
+      const bits = +g[r];
+      for (let c = 0; c < 3; c++) {
+        if (bits & (4 >> c)) ctx.fillRect(x + i * 4 * sc + c * sc, y + r * sc, sc, sc);
+      }
+    }
+  }
+}
+function text(s, x, y, sc = 1, col = '#fff', align = 'left', shadow = '#000') {
+  s = String(s).toUpperCase();
+  const w = s.length * 4 * sc - sc;
+  if (align === 'center') x = Math.round(x - w / 2);
+  else if (align === 'right') x = Math.round(x - w);
+  if (shadow) drawGlyphs(s, x + sc, y + sc, sc, shadow);
+  drawGlyphs(s, x, y, sc, col);
+}
+
+// ---------------------------------------------------------------------------
+// Audio (all generated with WebAudio)
+// ---------------------------------------------------------------------------
+let actx = null, master, sfxGain, musicGain, noiseBuf, muted = false;
+try { muted = localStorage.getItem('lanternMoth.muted') === '1'; } catch (e) {}
+
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  master = actx.createGain(); master.gain.value = muted ? 0 : 1; master.connect(actx.destination);
+  sfxGain = actx.createGain(); sfxGain.gain.value = 0.5; sfxGain.connect(master);
+  musicGain = actx.createGain(); musicGain.gain.value = 0.2; musicGain.connect(master);
+  noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  nextNoteT = actx.currentTime + 0.1;
+  setInterval(scheduleMusic, 40);
+}
+
+function tone(f, dur, type = 'square', vol = 0.3, f2 = null, when = 0, dest = sfxGain) {
+  if (!actx) return;
+  const t0 = actx.currentTime + Math.max(0, when);
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t0);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(dest);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function noise(dur, vol, freq = 1000, q = 1, when = 0, dest = sfxGain, f2 = null) {
+  if (!actx) return;
+  const t0 = actx.currentTime + Math.max(0, when);
+  const s = actx.createBufferSource(); s.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+  bp.frequency.setValueAtTime(freq, t0);
+  if (f2) bp.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(bp); bp.connect(g); g.connect(dest);
+  s.start(t0, Math.random() * 0.5); s.stop(t0 + dur);
+}
+
+const sfx = {
+  flap()      { tone(260, 0.07, 'triangle', 0.25, 430); },
+  spark()     { tone(990, 0.06, 'square', 0.12); tone(1480, 0.1, 'square', 0.12, null, 0.06); },
+  hit()       { noise(0.25, 0.6, 800, 0.7); tone(220, 0.25, 'sawtooth', 0.18, 55); },
+  whoosh()    { noise(0.45, 0.35, 300, 1.5, 0, sfxGain, 1600); },
+  milestone() { [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.12, 'square', 0.1, null, i * 0.07)); },
+  over()      { [392, 330, 262, 196].forEach((f, i) => tone(f, 0.25, 'square', 0.14, null, i * 0.18)); },
+};
+
+// Looping chiptune: Am - F - C - G arpeggios over a triangle bass
+const STEP = 60 / 132 / 2;
+const CHORDS = [[0, 3, 7, 12], [-4, 0, 3, 8], [-9, -5, -2, 3], [-2, 2, 5, 10]];
+const BASS = [-24, -28, -21, -26];
+const ARP = [0, 1, 2, 3, 2, 1, 2, 1];
+const ARP_B = [3, 2, 1, 0, 1, 2, 3, 2];
+let musicStep = 0, nextNoteT = 0;
+const nf = n => 440 * Math.pow(2, n / 12);
+function scheduleMusic() {
+  if (!actx || actx.state !== 'running') return;
+  if (nextNoteT < actx.currentTime) nextNoteT = actx.currentTime + 0.05;
+  while (nextNoteT < actx.currentTime + 0.15) {
+    const bar = Math.floor(musicStep / 8) % 4, s = musicStep % 8;
+    const phrase = Math.floor(musicStep / 32) % 2;
+    const ch = CHORDS[bar], w = nextNoteT - actx.currentTime;
+    tone(nf(ch[(phrase ? ARP_B : ARP)[s]]), STEP * 0.9, 'square', 0.12, null, w, musicGain);
+    if (s % 2 === 0) tone(nf(BASS[bar]), STEP * 1.8, 'triangle', 0.5, null, w, musicGain);
+    else noise(0.03, 0.15, 7000, 1, w, musicGain);
+    musicStep++;
+    nextNoteT += STEP;
+  }
+}
+function setMusicLevel(v) { if (actx) musicGain.gain.setTargetAtTime(v, actx.currentTime, 0.3); }
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('lanternMoth.muted', muted ? '1' : '0'); } catch (e) {}
+  if (actx) master.gain.setTargetAtTime(muted ? 0 : 1, actx.currentTime, 0.02);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!actx) return;
+  if (document.hidden) actx.suspend(); else actx.resume();
+});
+
+// ---------------------------------------------------------------------------
+// Game state
+// ---------------------------------------------------------------------------
+let state = 'title', t = 0;
+let moth, camY, ents, parts, pops, light, lightR, invuln, shake, flash;
+let nextY, maxM, sparkCount, overT, lastMilestone, emberT, draftId;
+
+function reset() {
+  moth = { x: W / 2, y: 0, vx: 34, vy: 0, flapT: 0 };
+  camY = -H * 0.62;
+  ents = []; parts = []; pops = [];
+  light = 100; lightR = 76; invuln = 0; shake = 0; flash = 0;
+  nextY = -110; maxM = 0; sparkCount = 0; overT = 0; lastMilestone = 0; emberT = 0; draftId = null;
+  addSpark(W / 2, -60);
+  ensureRows();
+}
+
+function addSpark(x, y) { ents.push({ type: 'spark', x, y, ph: rand(0, 6.28) }); }
+
+function pick(opts) {
+  let total = opts.reduce((a, o) => a + o[1], 0), r = Math.random() * total;
+  for (const o of opts) { if ((r -= o[1]) <= 0) return o[0]; }
+  return opts[0][0];
+}
+
+// Generate one "row" of challenge at world height y. Hazards unlock with height.
+function spawnRow(y) {
+  const m = -y / PX_PER_M, d = clamp(m / 1000, 0, 1);
+  const opts = [['ledge', 3]];
+  if (m > 50) opts.push(['draft', 0.8 + d]);
+  if (m > 110) opts.push(['spider', 0.9 + d]);
+  if (m > 190) opts.push(['bat', 0.9 + d]);
+  const type = pick(opts);
+
+  if (type === 'ledge') {
+    const gw = Math.round(lerp(46, 28, d) + rand(0, 8));
+    const gx = Math.round(rand(WALL + 4, W - WALL - 4 - gw));
+    ents.push({ type, y: Math.round(y), gx, gw, h: 6 });
+    if (Math.random() < 0.5) addSpark(gx + gw / 2, y - 14);
+  } else if (type === 'draft') {
+    const dirs = ['l', 'r'];
+    if (m > 300) dirs.push('d');
+    const dir = dirs[Math.floor(Math.random() * dirs.length)];
+    const h = 36;
+    ents.push({
+      type, y: y - h, h, dir, f: lerp(40, 75, d), id: Math.random(),
+      streaks: Array.from({ length: 8 }, () => ({ x: rand(WALL, W - WALL), y: rand(0, h), l: rand(4, 9) })),
+    });
+  } else if (type === 'spider') {
+    const count = d > 0.45 && Math.random() < d * 0.7 ? 2 : 1;
+    for (let i = 0; i < count; i++) {
+      const x = count === 1 ? rand(WALL + 10, W - WALL - 10)
+        : (i === 0 ? rand(WALL + 10, W / 2 - 8) : rand(W / 2 + 8, W - WALL - 10));
+      const s = { type, x: Math.round(x), cy: y - 20, amp: lerp(8, 18, d), sp: lerp(1.5, 2.6, d), ph: rand(0, 6.28) };
+      s.y = s.cy;
+      ents.push(s);
+    }
+  } else {
+    const b = { type: 'bat', y0: y - 15, x: rand(WALL + 6, W - WALL - 6),
+      vx: (Math.random() < 0.5 ? -1 : 1) * lerp(30, 60, d), ph: rand(0, 6.28) };
+    b.y = b.y0;
+    ents.push(b);
+  }
+
+  const gap = lerp(72, 48, d) + rand(0, 22);
+  if (Math.random() < lerp(0.75, 0.4, d)) addSpark(rand(WALL + 8, W - WALL - 8), y - gap / 2);
+  nextY -= gap;
+}
+function ensureRows() { while (nextY > camY - 60) spawnRow(nextY); }
+
+function burst(x, y, n, colors, speed, glow, life = 0.6) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(speed * 0.3, speed);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life,
+      col: colors[Math.floor(Math.random() * colors.length)], glow, g: 0 });
+  }
+}
+function popup(x, y, s, col) { pops.push({ x, y, s, col, life: 1 }); }
+
+function startGame() {
+  reset();
+  state = 'play';
+  setMusicLevel(0.2);
+  flap();
+}
+function flap() {
+  moth.vy = -FLAP;
+  moth.flapT = 0.12;
+  sfx.flap();
+  for (let i = 0; i < 2; i++) {
+    parts.push({ x: moth.x + rand(-3, 3), y: moth.y + 2, vx: rand(-10, 10), vy: rand(20, 40),
+      life: 0.35, max: 0.35, col: '#c8b898', glow: false, g: 0 });
+  }
+}
+function hurt(amount, force) {
+  if (invuln > 0 && !force) return;
+  light -= amount;
+  invuln = 1.1; shake = 4; flash = 0.45;
+  sfx.hit();
+  burst(moth.x, moth.y, 12, ['#ffb84a', '#fff4d0', '#ff7a3a'], 60, true);
+  popup(moth.x, moth.y - 8, '-LIGHT', '#ff7a5a');
+}
+function gameOver() {
+  state = 'over'; overT = 0; light = 0;
+  sfx.over();
+  setMusicLevel(0.07);
+}
+
+const overlap = (ax, ay, aw, ah, bx, by, bw, bh) => ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+function targetR() {
+  const low = light < 25;
+  return 14 + light * 0.62 + Math.sin(t * 19) * (low ? 2.5 : 1) + rand(-0.5, 0.5) * (low ? 3 : 1);
+}
+
+function updateFx(dt) {
+  for (const p of parts) {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 1 - dt * 2; p.vy *= 1 - dt * 2;
+    p.life -= dt;
+  }
+  parts = parts.filter(p => p.life > 0);
+  for (const p of pops) { p.y -= 16 * dt; p.life -= dt * 0.9; }
+  pops = pops.filter(p => p.life > 0);
+  emberT -= dt;
+  if (emberT <= 0 && state !== 'over') {
+    emberT = rand(0.08, 0.2);
+    parts.push({ x: moth.x + rand(-1, 1), y: moth.y + 6, vx: rand(-6, 6), vy: rand(-22, -8),
+      life: 0.6, max: 0.6, col: Math.random() < 0.5 ? '#ffb84a' : '#ffe08a', glow: true });
+  }
+}
+
+function updateEnts(dt) {
+  for (const e of ents) {
+    if (e.type === 'spider') {
+      e.y = e.cy + Math.sin(t * e.sp + e.ph) * e.amp;
+    } else if (e.type === 'bat') {
+      e.x += e.vx * dt;
+      if (e.x < WALL + 5) { e.x = WALL + 5; e.vx = Math.abs(e.vx); }
+      if (e.x > W - WALL - 5) { e.x = W - WALL - 5; e.vx = -Math.abs(e.vx); }
+      e.y = e.y0 + Math.sin(t * 3 + e.ph) * 7;
+    } else if (e.type === 'draft') {
+      const v = e.f * 1.6 * dt;
+      for (const s of e.streaks) {
+        if (e.dir === 'l') { s.x -= v; if (s.x < WALL - s.l) s.x = W - WALL; }
+        else if (e.dir === 'r') { s.x += v; if (s.x > W - WALL) s.x = WALL - s.l; }
+        else { s.y += v; if (s.y > e.h) s.y = -s.l; }
+      }
+    }
+  }
+}
+
+function update(dt) {
+  t += dt;
+  shake = Math.max(0, shake - dt * 12);
+  flash = Math.max(0, flash - dt * 2.5);
+  invuln = Math.max(0, invuln - dt);
+  moth.flapT = Math.max(0, moth.flapT - dt);
+
+  if (state === 'title') {
+    moth.y = Math.sin(t * 2.2) * 4;
+    updateEnts(dt); updateFx(dt);
+    lightR = targetR();
+    return;
+  }
+  if (state === 'over') {
+    overT += dt;
+    moth.vy = Math.min(moth.vy + GRAV * dt, MAXFALL);
+    moth.y += moth.vy * dt;
+    lightR = Math.max(0, lightR - dt * 80);
+    updateEnts(dt); updateFx(dt);
+    return;
+  }
+
+  // --- play ---
+  const d = clamp(maxM / 1000, 0, 1);
+  updateEnts(dt);
+
+  moth.vy = Math.min(moth.vy + GRAV * dt, MAXFALL);
+  moth.vx = Math.sign(moth.vx || 1) * (32 + d * 16);
+
+  // drafts
+  let ex = 0, inDraft = null;
+  for (const e of ents) {
+    if (e.type !== 'draft' || moth.y < e.y || moth.y > e.y + e.h) continue;
+    inDraft = e.id;
+    if (e.dir === 'l') ex -= e.f;
+    else if (e.dir === 'r') ex += e.f;
+    else moth.vy += e.f * 3 * dt;
+  }
+  if (inDraft !== null && inDraft !== draftId) sfx.whoosh();
+  draftId = inDraft;
+
+  moth.x += (moth.vx + ex) * dt;
+  moth.y += moth.vy * dt;
+  if (moth.x < WALL + 4) { moth.x = WALL + 4; moth.vx = Math.abs(moth.vx); }
+  if (moth.x > W - WALL - 4) { moth.x = W - WALL - 4; moth.vx = -Math.abs(moth.vx); }
+
+  // collisions; moth hitbox is 7x8 around its body and lantern
+  const mb = () => [moth.x - 3, moth.y - 3, 7, 8];
+  for (const e of ents) {
+    if (e.type === 'ledge') {
+      const rects = [[WALL, e.gx - WALL], [e.gx + e.gw, W - WALL - (e.gx + e.gw)]];
+      for (const [rx, rw] of rects) {
+        if (rw <= 0) continue;
+        const [bx, by, bw, bh] = mb();
+        if (!overlap(bx, by, bw, bh, rx, e.y, rw, e.h)) continue;
+        const ox = Math.min(bx + bw - rx, rx + rw - bx);
+        const oy = Math.min(by + bh - e.y, e.y + e.h - by);
+        if (oy < ox) {
+          if (moth.y < e.y + e.h / 2) {           // landed on top: safe perch
+            moth.y -= oy; if (moth.vy > 0) moth.vy = 0;
+          } else {                                 // bonked from below
+            moth.y += oy; moth.vy = Math.max(moth.vy, 40);
+            hurt(22);
+          }
+        } else {                                   // hit the edge of the gap
+          moth.x += bx < rx ? -ox : ox;
+          moth.vx = -moth.vx;
+          hurt(22);
+        }
+      }
+    } else if (e.type === 'spider' || e.type === 'bat') {
+      const [bx, by, bw, bh] = mb();
+      const hit = e.type === 'spider'
+        ? overlap(bx, by, bw, bh, e.x - 3, e.y - 2, 7, 5)
+        : overlap(bx, by, bw, bh, e.x - 4, e.y - 2, 9, 4);
+      if (hit && invuln <= 0) { hurt(22); moth.vy = 70; }
+    } else if (e.type === 'spark') {
+      const sy = e.y + Math.sin(t * 3 + e.ph) * 2;
+      if (Math.abs(moth.x - e.x) < 7 && Math.abs(moth.y + 1 - sy) < 8) {
+        e.dead = true;
+        light = Math.min(100, light + 14);
+        sparkCount++;
+        sfx.spark();
+        burst(e.x, sy, 10, ['#ffd24a', '#fff4d0', '#ff9a3a'], 45, true, 0.5);
+        popup(e.x, sy - 6, '+10', '#ffe08a');
+      }
+    }
+  }
+  ents = ents.filter(e => !e.dead);
+
+  // falling off the bottom of the screen
+  if (moth.y > camY + H + 6) {
+    moth.y = camY + H + 6;
+    moth.vy = -260;
+    hurt(20, true);
+  }
+
+  // light drains faster the higher you climb
+  light -= (3.2 + d * 5) * dt;
+  lightR = targetR();
+  if (light <= 0) { gameOver(); return; }
+
+  // camera only ever moves up
+  const target = moth.y - H * 0.62;
+  if (target < camY) camY += (target - camY) * Math.min(1, dt * 8);
+
+  maxM = Math.max(maxM, -moth.y / PX_PER_M);
+  const ms = Math.floor(maxM / 100);
+  if (ms > lastMilestone) {
+    lastMilestone = ms;
+    sfx.milestone();
+    popup(W / 2, moth.y - 14, ms * 100 + 'M!', '#9ae0ff');
+  }
+
+  ensureRows();
+  ents = ents.filter(e => {
+    const bottom = e.type === 'draft' ? e.y + e.h : e.type === 'spider' ? e.cy + 30 : e.type === 'bat' ? e.y0 + 10 : e.y + 10;
+    return bottom > camY - 400 && bottom < camY + H + 80;
+  });
+  updateFx(dt);
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+function drawLedge(x, y, w, h) {
+  if (w <= 0) return;
+  ctx.fillStyle = '#6e3a28'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = '#a05a3a'; ctx.fillRect(x, y, w, 1);
+  ctx.fillStyle = '#3a1c14'; ctx.fillRect(x, y + h - 1, w, 1);
+  ctx.fillStyle = '#44201a';
+  ctx.fillRect(x, y + 3, w, 1);
+  for (let i = x + 2; i < x + w; i += 8) ctx.fillRect(i, y + 1, 1, 2);
+  for (let i = x + 6; i < x + w; i += 8) ctx.fillRect(i, y + 4, 1, 1);
+}
+
+function hole(x, y, r) {
+  if (r <= 0) return;
+  const g = dctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(0,0,0,1)');
+  g.addColorStop(0.55, 'rgba(0,0,0,1)');
+  g.addColorStop(0.55, 'rgba(0,0,0,0.7)');
+  g.addColorStop(0.76, 'rgba(0,0,0,0.7)');
+  g.addColorStop(0.76, 'rgba(0,0,0,0.35)');
+  g.addColorStop(0.9, 'rgba(0,0,0,0.35)');
+  g.addColorStop(0.9, 'rgba(0,0,0,0)');
+  dctx.fillStyle = g;
+  dctx.beginPath(); dctx.arc(x, y, r, 0, Math.PI * 2); dctx.fill();
+}
+
+function render() {
+  const sx = shake > 0 ? Math.round(rand(-shake, shake)) : 0;
+  const sy = shake > 0 ? Math.round(rand(-shake, shake)) : 0;
+  const cy = Math.round(camY);
+  const toWorld = () => ctx.setTransform(1, 0, 0, 1, sx, -cy + sy);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#07050c'; ctx.fillRect(0, 0, W, H);
+
+  // ---- world (lit only by the lantern) ----
+  toWorld();
+  ctx.fillStyle = patBack; ctx.fillRect(-8, cy - 8, W + 16, H + 16);
+
+  for (const e of ents) {
+    if (e.type === 'ledge') {
+      drawLedge(WALL, e.y, e.gx - WALL, e.h);
+      drawLedge(e.gx + e.gw, e.y, W - WALL - (e.gx + e.gw), e.h);
+    } else if (e.type === 'spider') {
+      ctx.fillStyle = '#9a8aa8';
+      ctx.fillRect(e.x, cy - 8, 1, Math.round(e.y) - cy + 6);
+      ctx.drawImage(SPIDER, e.x - 3, Math.round(e.y) - 2);
+    } else if (e.type === 'bat') {
+      ctx.drawImage(Math.floor(t * 8 + e.ph) % 2 ? BAT_A : BAT_B, Math.round(e.x) - 5, Math.round(e.y) - 2);
+    }
+  }
+
+  ctx.fillStyle = patWall;
+  ctx.fillRect(-8, cy - 8, WALL + 8, H + 16);
+  ctx.fillRect(W - WALL, cy - 8, WALL + 8, H + 16);
+  ctx.fillStyle = '#1a0c08';
+  ctx.fillRect(WALL, cy - 8, 1, H + 16);
+  ctx.fillRect(W - WALL - 1, cy - 8, 1, H + 16);
+
+  if (!(invuln > 0 && Math.floor(t * 20) % 2)) {
+    const fr = state === 'over' ? MOTH_A : (moth.flapT > 0 || Math.floor(t * 9) % 2 ? MOTH_B : MOTH_A);
+    ctx.drawImage(fr, Math.round(moth.x) - 4, Math.round(moth.y) - 4);
+  }
+  for (const p of parts) {
+    if (p.glow) continue;
+    ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 1);
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- darkness ----
+  dctx.globalCompositeOperation = 'source-over';
+  dctx.clearRect(0, 0, W, H);
+  dctx.fillStyle = 'rgba(7,5,12,0.97)';
+  dctx.fillRect(0, 0, W, H);
+  dctx.globalCompositeOperation = 'destination-out';
+  const lx = Math.round(moth.x) + sx, ly = Math.round(moth.y) + 3 - cy + sy;
+  hole(lx, ly, lightR);
+  for (const e of ents) if (e.type === 'spark') hole(e.x + sx, e.y - cy + sy, 9);
+  dctx.globalCompositeOperation = 'source-over';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(dark, 0, 0);
+
+  // warm glow
+  if (lightR > 2) {
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(lx, ly, 0, lx, ly, lightR);
+    g.addColorStop(0, 'rgba(255,170,70,0.22)');
+    g.addColorStop(1, 'rgba(255,170,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // ---- things that shine through the dark ----
+  toWorld();
+  // height markers every 100 m
+  const topM = Math.floor(-cy / PX_PER_M / 100) * 100;
+  for (let m = topM; m > topM - 400 && m > 0; m -= 100) {
+    const y = -m * PX_PER_M;
+    if (y < cy - 8 || y > cy + H + 8) continue;
+    ctx.fillStyle = 'rgba(255,220,160,0.22)';
+    for (let x = WALL + 1; x < W - WALL - 1; x += 4) ctx.fillRect(x, y, 2, 1);
+    ctx.globalAlpha = 0.5; text(m + 'M', W - WALL - 2, y - 7, 1, '#ffdca0', 'right', null); ctx.globalAlpha = 1;
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(WALL, cy - 8, W - 2 * WALL, H + 16); ctx.clip();
+  for (const e of ents) {
+    if (e.type !== 'draft') continue;
+    ctx.fillStyle = 'rgba(150,180,255,0.035)';
+    ctx.fillRect(WALL, e.y, W - 2 * WALL, e.h);
+    ctx.fillStyle = 'rgba(190,210,255,0.4)';
+    for (const s of e.streaks) {
+      if (e.dir === 'd') ctx.fillRect(Math.round(s.x), Math.round(e.y + s.y), 1, Math.round(s.l));
+      else ctx.fillRect(Math.round(s.x), Math.round(e.y + s.y), Math.round(s.l), 1);
+    }
+  }
+  ctx.restore();
+  for (const e of ents) {
+    if (e.type === 'draft') {
+      continue;
+    } else if (e.type === 'spider') {
+      ctx.fillStyle = '#ff4a4a';
+      ctx.fillRect(e.x - 2, Math.round(e.y), 1, 1); ctx.fillRect(e.x, Math.round(e.y), 1, 1);
+    } else if (e.type === 'bat') {
+      const up = Math.floor(t * 8 + e.ph) % 2;
+      const bx = Math.round(e.x) - 5, by = Math.round(e.y) - 2 + (up ? 3 : 2);
+      ctx.fillStyle = '#ff5a3a';
+      ctx.fillRect(bx + 4, by, 1, 1); ctx.fillRect(bx + 6, by, 1, 1);
+    } else if (e.type === 'spark') {
+      const y = Math.round(e.y + Math.sin(t * 3 + e.ph) * 2), x = Math.round(e.x);
+      const on = Math.floor(t * 10 + e.ph) % 2;
+      ctx.fillStyle = on ? '#ff9a3a' : '#ffd24a';
+      ctx.fillRect(x - 1, y, 3, 1); ctx.fillRect(x, y - 1, 1, 3);
+      if (on) { ctx.fillRect(x - 2, y, 1, 1); ctx.fillRect(x + 2, y, 1, 1); ctx.fillRect(x, y - 2, 1, 1); ctx.fillRect(x, y + 2, 1, 1); }
+      ctx.fillStyle = '#fff8e0'; ctx.fillRect(x, y, 1, 1);
+    }
+  }
+  if (state !== 'over' || lightR > 0) {
+    ctx.fillStyle = '#ffd24a';
+    ctx.fillRect(Math.round(moth.x), Math.round(moth.y) + 3, 1, 1);
+  }
+  for (const p of parts) {
+    if (!p.glow) continue;
+    ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 1);
+  }
+  ctx.globalAlpha = 1;
+  for (const p of pops) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    text(p.s, p.x, Math.round(p.y), 1, p.col, 'center');
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- screen space ----
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,120,80,${flash * 0.5})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (state === 'play') drawHud();
+  else if (state === 'title') drawTitle();
+  else drawOver();
+  drawMuteIcon();
+}
+
+function drawHud() {
+  // lantern icon
+  ctx.fillStyle = '#000'; ctx.fillRect(4, 3, 5, 8);
+  ctx.fillStyle = '#8a7a6a'; ctx.fillRect(5, 3, 3, 1);
+  ctx.fillStyle = '#6a5040'; ctx.fillRect(4, 4, 4, 6);
+  ctx.fillStyle = '#ffd24a'; ctx.fillRect(5, 5, 2, 4);
+  // light bar
+  const low = light < 25, blink = low && Math.floor(t * 6) % 2;
+  ctx.fillStyle = blink ? '#ff4a3a' : '#000'; ctx.fillRect(10, 4, 42, 6);
+  ctx.fillStyle = '#2a1a24'; ctx.fillRect(11, 5, 40, 4);
+  const w = Math.max(0, Math.round(40 * light / 100));
+  ctx.fillStyle = light > 50 ? '#ffd24a' : light > 25 ? '#ff9a3a' : '#ff4a3a';
+  ctx.fillRect(11, 5, w, 4);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillRect(11, 5, w, 1);
+  // height
+  text(Math.floor(maxM) + 'M', W / 2 + 8, 4, 1, '#fff', 'center');
+}
+
+function drawMuteIcon() {
+  const x = W - 14, y = 4;
+  ctx.fillStyle = '#000'; ctx.fillRect(x - 1, y - 1, 12, 9);
+  ctx.fillStyle = '#ecdcb4';
+  ctx.fillRect(x, y + 2, 2, 3); ctx.fillRect(x + 2, y + 1, 1, 5); ctx.fillRect(x + 3, y, 1, 7);
+  if (muted) {
+    ctx.fillStyle = '#ff5a4a';
+    for (let i = 0; i < 4; i++) { ctx.fillRect(x + 5 + i, y + 1 + i, 1, 1); ctx.fillRect(x + 8 - i, y + 1 + i, 1, 1); }
+  } else {
+    ctx.fillRect(x + 5, y + 2, 1, 3); ctx.fillRect(x + 7, y + 1, 1, 5); ctx.fillRect(x + 9, y, 1, 7);
+  }
+}
+
+function drawTitle() {
+  const y0 = Math.round(H * 0.14);
+  text('LANTERN', W / 2, y0, 3, '#ffd24a', 'center', '#5a2a10');
+  text('MOTH', W / 2, y0 + 20, 3, '#ecdcb4', 'center', '#3a2a1a');
+  text('CLIMB THE DARK CHIMNEY', W / 2, y0 + 44, 1, '#c8b0a0', 'center');
+  const yb = Math.round(H * 0.78);
+  text('TAP TO FLAP', W / 2, yb, 1, '#ecdcb4', 'center');
+  text('SPARKS KEEP YOUR LIGHT ALIVE', W / 2, yb + 9, 1, '#ffb84a', 'center');
+  if (Math.floor(t * 2.5) % 2) text('TAP TO START', W / 2, yb + 24, 1, '#fff', 'center');
+}
+
+function drawOver() {
+  if (overT < 0.7) return;
+  ctx.fillStyle = 'rgba(7,5,12,0.6)'; ctx.fillRect(0, 0, W, H);
+  const y0 = Math.round(H * 0.24);
+  text('THE LIGHT', W / 2, y0, 2, '#ff9a3a', 'center', '#3a1408');
+  text('WENT OUT', W / 2, y0 + 14, 2, '#ff9a3a', 'center', '#3a1408');
+  const score = Math.floor(maxM) + sparkCount * 10;
+  text('HEIGHT', 34, y0 + 42, 1, '#c8b0a0');
+  text(Math.floor(maxM) + 'M', W - 34, y0 + 42, 1, '#fff', 'right');
+  text('SPARKS', 34, y0 + 52, 1, '#c8b0a0');
+  text(String(sparkCount), W - 34, y0 + 52, 1, '#ffd24a', 'right');
+  ctx.fillStyle = '#5a4050'; ctx.fillRect(34, y0 + 61, W - 68, 1);
+  text('SCORE', 34, y0 + 66, 1, '#ecdcb4');
+  text(String(score), W - 34, y0 + 66, 1, '#fff', 'right');
+  if (overT > 1 && Math.floor(t * 2.5) % 2) text('TAP TO RETRY', W / 2, Math.round(H * 0.78), 1, '#fff', 'center');
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+function press() {
+  initAudio();
+  if (state === 'title') startGame();
+  else if (state === 'play') flap();
+  else if (state === 'over' && overT > 1) startGame();
+}
+window.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  const px = (e.clientX - r.left) / r.width * W, py = (e.clientY - r.top) / r.height * H;
+  if (px > W - 20 && px <= W + 4 && py >= -4 && py < 16) { initAudio(); toggleMute(); return; }
+  press();
+}, { passive: false });
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Enter') { e.preventDefault(); press(); }
+  else if (e.code === 'KeyM') { initAudio(); toggleMute(); }
+});
+['touchstart', 'touchmove', 'gesturestart', 'contextmenu', 'dblclick'].forEach(ev =>
+  window.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+reset();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(1 / 30, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
