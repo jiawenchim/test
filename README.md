@@ -18,3 +18,9 @@ See [GAME_DESIGN.md](GAME_DESIGN.md) for the design.
 every 200 m you pick one of three gifts: auto-firing weapons (Ember Bolt, Flame
 Ring, Glow Nova) or passives (shield, magnet, brick smashing, revive and more).
 Wax earned each run buys permanent upgrades, saved on your device.
+
+## Lantern Moth II Hold (variant)
+
+`v2-hold/index.html` is Lantern Moth II plus a hold action. Tap to flap as
+before. Keep your finger down to stop zigzagging and glide straight down
+slowly, so you can line up with a gap. Release and tap to climb again.
